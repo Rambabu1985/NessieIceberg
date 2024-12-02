@@ -37,6 +37,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.stream.Collectors;
 import javax.annotation.Nullable;
 import org.immutables.value.Value;
 import org.projectnessie.catalog.formats.iceberg.meta.IcebergPartitionSpec;
@@ -156,8 +157,14 @@ public interface IcebergMetadataUpdate {
 
     @Override
     default void applyToTable(IcebergTableMetadataUpdateState state) {
-      throw new UnsupportedOperationException(
-          "Nessie Catalog does not allow external snapshot management");
+      state.addCatalogOp(CatalogOps.META_REMOVE_SNAPSHOTS);
+      var ids = new HashSet<>(snapshotIds());
+      state
+          .builder()
+          .previousIcebergSnapshotIds(
+              state.snapshot().previousIcebergSnapshotIds().stream()
+                  .filter(id -> !ids.contains(id))
+                  .collect(Collectors.toList()));
     }
   }
 

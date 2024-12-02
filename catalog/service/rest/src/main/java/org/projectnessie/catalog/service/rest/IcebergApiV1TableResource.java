@@ -15,6 +15,8 @@
  */
 package org.projectnessie.catalog.service.rest;
 
+import static com.google.common.base.Preconditions.checkArgument;
+import static com.google.common.base.Preconditions.checkState;
 import static java.lang.String.format;
 import static java.util.Objects.requireNonNull;
 import static java.util.UUID.randomUUID;
@@ -100,6 +102,7 @@ import org.projectnessie.catalog.service.api.SnapshotResponse;
 import org.projectnessie.catalog.service.config.LakehouseConfig;
 import org.projectnessie.catalog.service.config.WarehouseConfig;
 import org.projectnessie.catalog.service.rest.IcebergErrorMapper.IcebergEntityKind;
+import org.projectnessie.error.NessieConflictException;
 import org.projectnessie.error.NessieContentNotFoundException;
 import org.projectnessie.error.NessieNotFoundException;
 import org.projectnessie.model.Branch;
@@ -179,11 +182,16 @@ public class IcebergApiV1TableResource extends IcebergApiV1ResourceBase {
       @HeaderParam("X-Iceberg-Access-Delegation") String dataAccess)
       throws IOException {
 
-    return loadTable(prefix, namespace, table, null, dataAccess)
+    TableRef tableRef = decodeTableRef(prefix, namespace, table);
+
+    // TODO should be optimized to not load the old snapshots in a follow-up, at best specialized to
+    //  only retrieve the credentials
+
+    return loadTable(tableRef, prefix, dataAccess, false)
         .map(
             loadTableResponse -> {
               var creds = loadTableResponse.storageCredentials();
-
+              checkState(creds != null, "no storage credentials for {}", tableRef);
               return ImmutableIcebergLoadCredentialsResponse.of(creds);
             });
   }
@@ -354,6 +362,7 @@ public class IcebergApiV1TableResource extends IcebergApiV1ResourceBase {
       IcebergTableMetadata stagedTableMetadata =
           nessieTableSnapshotToIceberg(
               snapshot,
+              List.of(),
               Optional.empty(),
               map -> map.put(IcebergTableMetadata.STAGED_PROPERTY, "true"));
 
@@ -415,8 +424,10 @@ public class IcebergApiV1TableResource extends IcebergApiV1ResourceBase {
     ParsedReference reference = requireNonNull(tableRef.reference());
     Branch ref = checkBranch(treeService.getReferenceByName(reference.name(), FetchOption.MINIMAL));
 
-    RequestMetaBuilder requestMeta =
-        apiWrite().addKeyAction(tableRef.contentKey(), CatalogOps.CATALOG_REGISTER_ENTITY.name());
+    var requestMeta =
+        apiWrite()
+            .addKeyAction(tableRef.contentKey(), CatalogOps.CATALOG_REGISTER_ENTITY.name())
+            .build();
 
     Optional<TableRef> catalogTableRef =
         uriInfo.resolveTableFromUri(registerTableRequest.metadataLocation());
@@ -433,30 +444,60 @@ public class IcebergApiV1TableResource extends IcebergApiV1ResourceBase {
       // It's technically a new table for Nessie, so need to clear the content-ID.
       Content newContent = contentResponse.getContent().withId(null);
 
-      Operations ops =
-          ImmutableOperations.builder()
-              .addOperations(Put.of(ctr.contentKey(), newContent))
-              .commitMeta(
-                  updateCommitMeta(
-                      format(
-                          "Register Iceberg table '%s' from '%s'",
-                          ctr.contentKey(), registerTableRequest.metadataLocation())))
-              .build();
-      CommitResponse committed =
-          treeService.commitMultipleOperations(
-              ref.getName(), ref.getHash(), ops, requestMeta.build());
-
-      return this.loadTable(
-          TableRef.tableRef(
+      var snapshotStage =
+          catalogService.retrieveSnapshot(
+              SnapshotReqParams.forSnapshotHttpReq(ctr.reference(), "iceberg", null),
               ctr.contentKey(),
-              ParsedReference.parsedReference(
-                  committed.getTargetBranch().getName(),
-                  committed.getTargetBranch().getHash(),
-                  BRANCH),
-              tableRef.warehouse()),
-          prefix,
-          dataAccess,
-          true);
+              ICEBERG_TABLE,
+              requestMeta,
+              ICEBERG_V1);
+
+      var committedStage =
+          snapshotStage.thenCompose(
+              snapshotResponse -> {
+                // This check should actually have already been in Nessie versions before 0.101.0.
+                checkArgument(
+                    ((NessieTableSnapshot) snapshotResponse.nessieSnapshot())
+                        .previousIcebergSnapshotIds()
+                        .isEmpty(),
+                    "Iceberg tables registered with Nessie must not have more than 1 snapshot. Please use Iceberg's "
+                        + "snapshot maintenance operations on the current source catalog to prune all but the current snapshot.");
+
+                Operations ops =
+                    ImmutableOperations.builder()
+                        .addOperations(Put.of(ctr.contentKey(), newContent))
+                        .commitMeta(
+                            updateCommitMeta(
+                                format(
+                                    "Register Iceberg table '%s' from '%s'",
+                                    ctr.contentKey(), registerTableRequest.metadataLocation())))
+                        .build();
+                try {
+                  CommitResponse committed =
+                      treeService.commitMultipleOperations(
+                          ref.getName(), ref.getHash(), ops, requestMeta);
+
+                  return this.loadTable(
+                          TableRef.tableRef(
+                              ctr.contentKey(),
+                              ParsedReference.parsedReference(
+                                  committed.getTargetBranch().getName(),
+                                  committed.getTargetBranch().getHash(),
+                                  BRANCH),
+                              tableRef.warehouse()),
+                          prefix,
+                          dataAccess,
+                          true)
+                      // It's a bit of a back-and-forth between Uni and CompletionStage here and a
+                      // few lines below.
+                      .subscribeAsCompletionStage();
+                } catch (NessieNotFoundException | NessieConflictException e) {
+                  throw new RuntimeException(e);
+                }
+              });
+
+      return Uni.createFrom().completionStage(committedStage);
+
     } else if (nessieCatalogUri) {
       throw new IllegalArgumentException(
           "Cannot register an Iceberg table using the URI "
@@ -471,6 +512,12 @@ public class IcebergApiV1TableResource extends IcebergApiV1ResourceBase {
       tableMetadata =
           IcebergJson.objectMapper().readValue(metadataInput, IcebergTableMetadata.class);
     }
+
+    // This check should actually have already been in Nessie versions before 0.101.0.
+    checkArgument(
+        tableMetadata.snapshots().size() <= 1,
+        "Iceberg tables registered with Nessie must not have more than 1 snapshot. Please use Iceberg's "
+            + "snapshot maintenance operations on the current source catalog to prune all but the current snapshot.");
 
     catalogService
         .validateStorageLocation(tableMetadata.location())
@@ -501,8 +548,7 @@ public class IcebergApiV1TableResource extends IcebergApiV1ResourceBase {
                         tableRef.contentKey(), registerTableRequest.metadataLocation())))
             .build();
     CommitResponse committed =
-        treeService.commitMultipleOperations(
-            ref.getName(), ref.getHash(), ops, requestMeta.build());
+        treeService.commitMultipleOperations(ref.getName(), ref.getHash(), ops, requestMeta);
 
     return this.loadTable(
         tableRef(

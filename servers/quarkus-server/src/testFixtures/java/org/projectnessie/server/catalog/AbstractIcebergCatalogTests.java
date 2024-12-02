@@ -56,6 +56,7 @@ import org.apache.iceberg.Table;
 import org.apache.iceberg.TableMetadata;
 import org.apache.iceberg.TableMetadataParser;
 import org.apache.iceberg.TableOperations;
+import org.apache.iceberg.TestHelpers;
 import org.apache.iceberg.Transaction;
 import org.apache.iceberg.UpdatePartitionSpec;
 import org.apache.iceberg.UpdateSchema;
@@ -71,6 +72,7 @@ import org.apache.iceberg.io.PositionOutputStream;
 import org.apache.iceberg.rest.RESTCatalog;
 import org.apache.iceberg.types.Types;
 import org.apache.iceberg.view.View;
+import org.assertj.core.api.Assertions;
 import org.assertj.core.api.SoftAssertions;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
@@ -520,6 +522,79 @@ public abstract class AbstractIcebergCatalogTests extends CatalogTests<RESTCatal
     try (PositionOutputStream out = table.io().newOutputFile(dataLocation).create()) {
       out.write("Hello World".getBytes(UTF_8));
     }
+  }
+
+  // Overridden to comply with Nessie's requirement that only a table with a SINGLE snapshot (or no
+  // snapshot) can be registered.
+  @Override
+  @Test
+  public void testRegisterTable() {
+    soft.assertThatIllegalArgumentException()
+        .isThrownBy(super::testRegisterTable)
+        .withMessage(
+            "Iceberg tables registered with Nessie must not have more than 1 snapshot. "
+                + "Please use Iceberg's snapshot maintenance operations on the current source catalog to prune all but the current snapshot.");
+  }
+
+  @Test
+  public void testRegisterTableSingleSnapshot() {
+    @SuppressWarnings("resource")
+    var catalog = catalog();
+
+    if (requiresNamespaceCreate()) {
+      catalog.createNamespace(TABLE.namespace());
+    }
+
+    Map<String, String> properties =
+        org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap.of(
+            "user", "someone", "created-at", "2023-01-15T00:00:01");
+    Table originalTable =
+        catalog
+            .buildTable(TABLE, SCHEMA)
+            .withPartitionSpec(SPEC)
+            .withSortOrder(WRITE_ORDER)
+            .withProperties(properties)
+            .create();
+
+    originalTable.newFastAppend().appendFile(FILE_A).commit();
+
+    TableOperations ops = ((BaseTable) originalTable).operations();
+    String metadataLocation = ops.current().metadataFileLocation();
+
+    catalog.dropTable(TABLE, false /* do not purge */);
+
+    Table registeredTable = catalog.registerTable(TABLE, metadataLocation);
+
+    Assertions.assertThat(registeredTable).isNotNull();
+    Assertions.assertThat(catalog.tableExists(TABLE)).as("Table must exist").isTrue();
+    Assertions.assertThat(registeredTable.properties())
+        .as("Props must match")
+        .containsAllEntriesOf(properties);
+    Assertions.assertThat(registeredTable.schema().asStruct())
+        .as("Schema must match")
+        .isEqualTo(originalTable.schema().asStruct());
+    Assertions.assertThat(registeredTable.specs())
+        .as("Specs must match")
+        .isEqualTo(originalTable.specs());
+    Assertions.assertThat(registeredTable.sortOrders())
+        .as("Sort orders must match")
+        .isEqualTo(originalTable.sortOrders());
+    Assertions.assertThat(registeredTable.currentSnapshot())
+        .as("Current snapshot must match")
+        .isEqualTo(originalTable.currentSnapshot());
+    Assertions.assertThat(registeredTable.snapshots())
+        .as("Snapshots must match")
+        .isEqualTo(originalTable.snapshots());
+    Assertions.assertThat(registeredTable.history())
+        .as("History must match")
+        .isEqualTo(originalTable.history());
+
+    TestHelpers.assertSameSchemaMap(registeredTable.schemas(), originalTable.schemas());
+    assertFiles(registeredTable, FILE_A);
+
+    Assertions.assertThat(catalog.loadTable(TABLE)).isNotNull();
+    Assertions.assertThat(catalog.dropTable(TABLE)).isTrue();
+    Assertions.assertThat(catalog.tableExists(TABLE)).isFalse();
   }
 
   /**

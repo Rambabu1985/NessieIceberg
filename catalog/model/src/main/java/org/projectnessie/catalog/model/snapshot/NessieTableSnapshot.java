@@ -120,6 +120,13 @@ public interface NessieTableSnapshot extends NessieEntitySnapshot<NessieTable> {
   @jakarta.annotation.Nullable
   Long icebergSnapshotId();
 
+  /**
+   * List of <em>previous</em> snapshot IDs, in the same order as Iceberg's {@code
+   * TableMetadata.snapshotLog}, which is oldest first, but without the current snapshot ID.
+   */
+  @JsonInclude(JsonInclude.Include.NON_EMPTY)
+  List<Long> previousIcebergSnapshotIds();
+
   @JsonInclude(JsonInclude.Include.NON_NULL)
   @Nullable
   @jakarta.annotation.Nullable
@@ -268,6 +275,18 @@ public interface NessieTableSnapshot extends NessieEntitySnapshot<NessieTable> {
 
     @CanIgnoreReturnValue
     Builder icebergSnapshotId(@Nullable Long icebergSnapshotId);
+
+    @CanIgnoreReturnValue
+    Builder addPreviousIcebergSnapshotId(long element);
+
+    @CanIgnoreReturnValue
+    Builder addPreviousIcebergSnapshotIds(long... elements);
+
+    @CanIgnoreReturnValue
+    Builder previousIcebergSnapshotIds(Iterable<Long> elements);
+
+    @CanIgnoreReturnValue
+    Builder addAllPreviousIcebergSnapshotIds(Iterable<Long> elements);
 
     @CanIgnoreReturnValue
     Builder icebergLastSequenceNumber(@Nullable Long icebergLastSequenceNumber);

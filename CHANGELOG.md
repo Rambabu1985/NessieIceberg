@@ -8,6 +8,12 @@ as necessary. Empty sections will not end in the release notes.
 
 ### Highlights
 
+- Nessie now returns the snapshot history in the `snapshots` and `snapshot-log` attributes of an Iceberg
+  table-metadata retrieved via Iceberg REST for table changes that have been committed via Iceberg REST
+  to Nessie 0.101.0 or newer. Commits made using older Nessie versions will not return older snapshots.
+- Generally, not only for Nessie, It is recommended to keep the number of snapshots maintained in an
+  Iceberg table-metadata as low as possible. Use the maintenance operations provided by Iceberg.
+
 ### Upgrade notes
 
 ### Breaking changes
@@ -17,6 +23,11 @@ as necessary. Empty sections will not end in the release notes.
 - Helm: Add clusterIP and traffic policy to helm service config
 
 ### Changes
+
+- Nessie now reports a "bad request" for Iceberg REST register-table for table metadata with more than
+  one snapshot. This is a safeguard to prevent running into snapshot validation errors when using Iceberg.
+  While older Nessie versions accepted registrations of table metadata with more than one snapshot, it
+  was not particularly safe.
 
 ### Deprecations
 

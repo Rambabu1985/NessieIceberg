@@ -654,11 +654,10 @@ public class NessieModelIceberg {
               currentSnapshot.manifests(); // TODO
             });
 
-    for (IcebergSnapshotLogEntry logEntry : iceberg.snapshotLog()) {
-      // TODO ??
-      logEntry.snapshotId();
-      logEntry.timestampMs();
-    }
+    iceberg.snapshotLog().stream()
+        .map(IcebergSnapshotLogEntry::snapshotId)
+        .filter(snapId -> !snapId.equals(iceberg.currentSnapshotId()))
+        .forEach(snapshot::addPreviousIcebergSnapshotId);
 
     for (IcebergStatisticsFile statisticsFile : iceberg.statistics()) {
       if (statisticsFile.snapshotId() == iceberg.currentSnapshotId()) {
@@ -943,6 +942,7 @@ public class NessieModelIceberg {
 
   public static IcebergTableMetadata nessieTableSnapshotToIceberg(
       NessieTableSnapshot nessie,
+      List<NessieEntitySnapshot<?>> history,
       Optional<IcebergSpec> requestedSpecVersion,
       Consumer<Map<String, String>> tablePropertiesTweak) {
     NessieTable entity = nessie.entity();
@@ -1045,6 +1045,19 @@ public class NessieModelIceberg {
       metadata.putRef(
           "main", IcebergSnapshotRef.builder().snapshotId(snapshotId).type("branch").build());
 
+      for (NessieEntitySnapshot<?> previous : history) {
+        var previousTmd =
+            nessieTableSnapshotToIceberg(
+                (NessieTableSnapshot) previous, List.of(), requestedSpecVersion, m -> {});
+        var previousSnap = previousTmd.currentSnapshot().orElseThrow();
+        metadata.addSnapshot(previousSnap);
+        metadata.addSnapshotLog(
+            IcebergSnapshotLogEntry.snapshotLogEntry(
+                previousSnap.timestampMs(), previousSnap.snapshotId()));
+        // TODO we don't include the metadata location yet - we could potentially do that later
+        // metadata.addMetadataLog(IcebergHistoryEntry.historyEntry(previousSnap.timestampMs(), ));
+      }
+
       metadata.addSnapshotLog(
           IcebergSnapshotLogEntry.builder()
               .snapshotId(snapshotId)
@@ -1079,9 +1092,6 @@ public class NessieModelIceberg {
               partitionStatisticsFile.statisticsPath(),
               partitionStatisticsFile.fileSizeInBytes()));
     }
-
-    //    metadata.addMetadataLog();
-    //    metadata.addSnapshotLog();
 
     return metadata.build();
   }
@@ -1577,13 +1587,18 @@ public class NessieModelIceberg {
     IcebergSnapshot icebergSnapshot = u.snapshot();
     Integer schemaId = icebergSnapshot.schemaId();
     NessieTableSnapshot snapshot = state.snapshot();
+    NessieTableSnapshot.Builder snapshotBuilder = state.builder();
     if (schemaId != null) {
       Optional<NessieSchema> schema = snapshot.schemaByIcebergId(schemaId);
-      schema.ifPresent(s -> state.builder().currentSchemaId(s.id()));
+      schema.ifPresent(s -> snapshotBuilder.currentSchemaId(s.id()));
     }
 
-    state
-        .builder()
+    var currentIcebergSnapshotId = snapshot.icebergSnapshotId();
+    if (currentIcebergSnapshotId != null && currentIcebergSnapshotId != -1L) {
+      snapshotBuilder.addPreviousIcebergSnapshotId(currentIcebergSnapshotId);
+    }
+
+    snapshotBuilder
         .icebergSnapshotId(icebergSnapshot.snapshotId())
         .icebergSnapshotSequenceNumber(icebergSnapshot.sequenceNumber())
         .icebergLastSequenceNumber(

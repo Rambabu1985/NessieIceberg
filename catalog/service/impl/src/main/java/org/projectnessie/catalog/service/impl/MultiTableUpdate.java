@@ -128,16 +128,19 @@ final class MultiTableUpdate {
 
   static final class SingleTableUpdate {
     final NessieEntitySnapshot<?> snapshot;
+    final List<NessieEntitySnapshot<?>> history;
     final Content content;
     final ContentKey key;
     final Set<CatalogOps> catalogOps;
 
     SingleTableUpdate(
         NessieEntitySnapshot<?> snapshot,
+        List<NessieEntitySnapshot<?>> history,
         Content content,
         ContentKey key,
         Set<CatalogOps> catalogOps) {
       this.snapshot = snapshot;
+      this.history = history;
       this.content = content;
       this.key = key;
       this.catalogOps = catalogOps;
