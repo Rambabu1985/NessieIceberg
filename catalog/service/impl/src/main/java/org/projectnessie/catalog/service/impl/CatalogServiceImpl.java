@@ -61,9 +61,10 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.OptionalInt;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
+import java.util.concurrent.TimeUnit;
 import java.util.function.BiFunction;
 import java.util.function.Consumer;
 import java.util.function.Function;
@@ -349,10 +350,11 @@ public class CatalogServiceImpl implements CatalogService {
     }
 
     return currentSnapshotStage.thenCompose(
-        snapshot -> collectSnapshotHistory(snapshot, historyLog, responseBuilder));
+        snapshot -> collectSnapshotHistory(first.getKey(), snapshot, historyLog, responseBuilder));
   }
 
   private <R> CompletionStage<R> collectSnapshotHistory(
+      ContentKey key,
       NessieEntitySnapshot<?> snapshot,
       Iterator<ContentHistoryEntry> historyLog,
       BiFunction<NessieEntitySnapshot<?>, List<NessieEntitySnapshot<?>>, R> responseBuilder) {
@@ -371,7 +373,7 @@ public class CatalogServiceImpl implements CatalogService {
 
     var remainingSnapshotIds = new HashSet<>(previousSnapshotIds);
 
-    var collectorStage = completedStage(new SnapshotHistoryCollector(snapshot));
+    var olderSnaps = new HashMap<Long, CompletableFuture<NessieEntitySnapshot<?>>>();
 
     while (!remainingSnapshotIds.isEmpty() && historyLog.hasNext()) {
       var next = historyLog.next();
@@ -386,7 +388,7 @@ public class CatalogServiceImpl implements CatalogService {
         continue;
       }
 
-      var olderSnapStage =
+      var olderSnap =
           icebergStuff()
               .retrieveIcebergSnapshot(snapshotObjIdForContent(nextContent), nextContent)
               .exceptionally(
@@ -396,38 +398,35 @@ public class CatalogServiceImpl implements CatalogService {
                         "Failed to retrieve table-metadata {}",
                         ((IcebergContent) nextContent).getMetadataLocation());
                     return null;
-                  });
-      collectorStage =
-          collectorStage.thenCombine(
-              olderSnapStage,
-              (collector, olderSnap) -> {
-                if (olderSnap != null) {
-                  collector.snapshotHistory.put(nextSnapshotId, olderSnap);
-                }
-                return collector;
-              });
+                  })
+              .toCompletableFuture();
+      olderSnaps.put(nextSnapshotId, olderSnap);
     }
 
-    return collectorStage.thenApply(
-        collector -> {
+    var olderSnapsFuture =
+        CompletableFuture.allOf(olderSnaps.values().toArray(CompletableFuture<?>[]::new));
+
+    return olderSnapsFuture.thenApply(
+        x -> {
           var history = new ArrayList<NessieEntitySnapshot<?>>();
           for (Long previousSnapshotId : previousSnapshotIds) {
-            var snap = collector.snapshotHistory.get(previousSnapshotId);
-            if (snap != null) {
-              history.add(snap);
+            try {
+              var snapFuture = olderSnaps.get(previousSnapshotId);
+              if (snapFuture != null) {
+                var snap = snapFuture.get(0, TimeUnit.SECONDS);
+                if (snap != null) {
+                  history.add(snap);
+                }
+              } else {
+                LOGGER.warn(
+                    "Requested snapshot {} for {} not in Nessie history", previousSnapshotId, key);
+              }
+            } catch (Exception e) {
+              throw new RuntimeException(e);
             }
           }
           return responseBuilder.apply(snapshot, history);
         });
-  }
-
-  private static final class SnapshotHistoryCollector {
-    final Map<Long, NessieEntitySnapshot<?>> snapshotHistory = new ConcurrentHashMap<>();
-    final NessieEntitySnapshot<?> currentSnapshot;
-
-    SnapshotHistoryCollector(NessieEntitySnapshot<?> currentSnapshot) {
-      this.currentSnapshot = currentSnapshot;
-    }
   }
 
   private SnapshotResponse snapshotResponse(
@@ -789,6 +788,7 @@ public class CatalogServiceImpl implements CatalogService {
                     var snapshot = updateState.snapshot();
 
                     return collectSnapshotHistory(
+                        op.getKey(),
                         snapshot,
                         contentHistory.history(),
                         (snap, history) -> Map.entry(updateState, history));
