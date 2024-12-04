@@ -168,7 +168,7 @@ public class IcebergGenerateFixtures {
             };
     UUID commitId = randomUUID();
     long snapshotId = 1;
-    long sequenceNumber = 1;
+    long sequenceNumber = 1000;
     long timestamp = 1715175169320L;
     IcebergManifestFileGenerator manifestFileGenerator =
         IcebergManifestFileGenerator.builder()
@@ -210,7 +210,7 @@ public class IcebergGenerateFixtures {
             .currentSnapshotId(snapshotId)
             .defaultSpecId(schemaGenerator.getIcebergPartitionSpec().specId())
             .defaultSortOrderId(IcebergSortOrder.UNSORTED_ORDER.orderId())
-            .lastSequenceNumber(1L)
+            .lastSequenceNumber(1000L)
             .addSnapshot(snapshotWithManifestList)
             .build();
     metadataConsumer.accept(icebergMetadataWithManifestList);

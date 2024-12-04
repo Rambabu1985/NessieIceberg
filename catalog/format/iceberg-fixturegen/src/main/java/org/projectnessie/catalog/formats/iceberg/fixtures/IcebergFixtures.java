@@ -177,6 +177,7 @@ public class IcebergFixtures {
                 .putSummary("operation", "testing")
                 .sequenceNumber(123L)
                 .timestampMs(12345678L)
+                .manifestList("s3://this-does-not-exist/anywhere/")
                 .build())
         .putRef("main", IcebergSnapshotRef.builder().type("branch").snapshotId(11).build())
         .addSnapshotLog(
