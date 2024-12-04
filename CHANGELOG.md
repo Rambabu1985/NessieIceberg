@@ -24,11 +24,6 @@ as necessary. Empty sections will not end in the release notes.
 
 ### Changes
 
-- Nessie now reports a "bad request" for Iceberg REST register-table for table metadata with more than
-  one snapshot. This is a safeguard to prevent running into snapshot validation errors when using Iceberg.
-  While older Nessie versions accepted registrations of table metadata with more than one snapshot, it
-  was not particularly safe.
-
 ### Deprecations
 
 ### Fixes

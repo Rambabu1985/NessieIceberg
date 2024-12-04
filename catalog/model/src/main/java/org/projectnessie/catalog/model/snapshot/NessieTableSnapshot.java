@@ -127,6 +127,12 @@ public interface NessieTableSnapshot extends NessieEntitySnapshot<NessieTable> {
   @JsonInclude(JsonInclude.Include.NON_EMPTY)
   List<Long> previousIcebergSnapshotIds();
 
+  /**
+   * Contains Iceberg snapshots for which no explicit Nessie commit exists. We need to memoize those
+   * snapshots here in case a single Iceberg transaction add multiple snapshots.
+   */
+  Map<Long, ImplicitIcebergSnapshot> implicitIcebergSnapshots();
+
   @JsonInclude(JsonInclude.Include.NON_NULL)
   @Nullable
   @jakarta.annotation.Nullable
@@ -287,6 +293,18 @@ public interface NessieTableSnapshot extends NessieEntitySnapshot<NessieTable> {
 
     @CanIgnoreReturnValue
     Builder addAllPreviousIcebergSnapshotIds(Iterable<Long> elements);
+
+    @CanIgnoreReturnValue
+    Builder putImplicitIcebergSnapshot(long key, ImplicitIcebergSnapshot value);
+
+    @CanIgnoreReturnValue
+    Builder putImplicitIcebergSnapshot(Map.Entry<Long, ? extends ImplicitIcebergSnapshot> entry);
+
+    @CanIgnoreReturnValue
+    Builder implicitIcebergSnapshots(Map<Long, ? extends ImplicitIcebergSnapshot> entries);
+
+    @CanIgnoreReturnValue
+    Builder putAllImplicitIcebergSnapshots(Map<Long, ? extends ImplicitIcebergSnapshot> entries);
 
     @CanIgnoreReturnValue
     Builder icebergLastSequenceNumber(@Nullable Long icebergLastSequenceNumber);

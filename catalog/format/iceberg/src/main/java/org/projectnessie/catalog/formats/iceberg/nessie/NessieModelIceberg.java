@@ -119,6 +119,8 @@ import org.projectnessie.catalog.model.schema.types.NessieTimeTypeSpec;
 import org.projectnessie.catalog.model.schema.types.NessieTimestampTypeSpec;
 import org.projectnessie.catalog.model.schema.types.NessieType;
 import org.projectnessie.catalog.model.schema.types.NessieTypeSpec;
+import org.projectnessie.catalog.model.snapshot.ImmutableImplicitIcebergSnapshot;
+import org.projectnessie.catalog.model.snapshot.ImplicitIcebergSnapshot;
 import org.projectnessie.catalog.model.snapshot.NessieEntitySnapshot;
 import org.projectnessie.catalog.model.snapshot.NessieTableSnapshot;
 import org.projectnessie.catalog.model.snapshot.NessieViewRepresentation;
@@ -512,7 +514,7 @@ public class NessieModelIceberg {
       Function<IcebergSnapshot, String> manifestListLocation) {
     NessieTableSnapshot.Builder snapshot = NessieTableSnapshot.builder().id(snapshotId);
     if (previous != null) {
-      snapshot.from(previous);
+      snapshot.from(previous).implicitIcebergSnapshots(Map.of());
 
       String previousLocation = previous.icebergLocation();
       if (previousLocation != null && !previousLocation.equals(iceberg.location())) {
@@ -623,10 +625,6 @@ public class NessieModelIceberg {
         .ifPresent(
             currentSnapshot -> {
               snapshot.icebergSnapshotId(currentSnapshot.snapshotId());
-              currentSnapshot
-                  .parentSnapshotId(); // TODO Can we leave this unset, as we do not return previous
-              // Iceberg
-              // snapshots??
               Integer schemaId = currentSnapshot.schemaId();
               if (schemaId != null) {
                 // TODO this overwrites the "current schema ID" with the schema ID of the current
@@ -654,10 +652,23 @@ public class NessieModelIceberg {
               currentSnapshot.manifests(); // TODO
             });
 
-    iceberg.snapshotLog().stream()
-        .map(IcebergSnapshotLogEntry::snapshotId)
-        .filter(snapId -> !snapId.equals(iceberg.currentSnapshotId()))
-        .forEach(snapshot::addPreviousIcebergSnapshotId);
+    for (var icebergSnapshotLogEntry : iceberg.snapshotLog()) {
+      var snapId = icebergSnapshotLogEntry.snapshotId();
+      if (snapId == iceberg.currentSnapshotId()) {
+        continue;
+      }
+      if (previous == null) {
+        var icebergSnap = iceberg.snapshotById(snapId);
+        if (icebergSnap.isEmpty()) {
+          throw new IllegalArgumentException(
+              "Invalid Iceberg table-metadata: snapshot-log references snapshot with ID "
+                  + snapId
+                  + ", which is not present as a snapshot object");
+        }
+        snapshot.putImplicitIcebergSnapshot(snapId, icebergSnap.get().asImplicitIcebergSnapshot());
+      }
+      snapshot.addPreviousIcebergSnapshotId(snapId);
+    }
 
     for (IcebergStatisticsFile statisticsFile : iceberg.statistics()) {
       if (statisticsFile.snapshotId() == iceberg.currentSnapshotId()) {
@@ -942,7 +953,7 @@ public class NessieModelIceberg {
 
   public static IcebergTableMetadata nessieTableSnapshotToIceberg(
       NessieTableSnapshot nessie,
-      List<NessieEntitySnapshot<?>> history,
+      List<ImplicitIcebergSnapshot> history,
       Optional<IcebergSpec> requestedSpecVersion,
       Consumer<Map<String, String>> tablePropertiesTweak) {
     NessieTable entity = nessie.entity();
@@ -1031,6 +1042,19 @@ public class NessieModelIceberg {
               ? nessie.icebergManifestFileLocations()
               : emptyList();
 
+      var parentSnapshotId = (Long) null;
+
+      for (ImplicitIcebergSnapshot previous : history) {
+        var snap = IcebergSnapshot.fromImplicitIcebergSnapshot(previous, parentSnapshotId);
+        metadata.addSnapshot(snap);
+        parentSnapshotId = snap.snapshotId();
+        metadata.addSnapshotLog(
+            IcebergSnapshotLogEntry.snapshotLogEntry(
+                previous.timestampMs(), previous.snapshotId()));
+        // TODO we don't include the metadata location yet - we could potentially do that later
+        // metadata.addMetadataLog(IcebergHistoryEntry.historyEntry(previousSnap.timestampMs(), ));
+      }
+
       IcebergSnapshot.Builder snapshot =
           IcebergSnapshot.builder()
               .snapshotId(snapshotId)
@@ -1039,24 +1063,12 @@ public class NessieModelIceberg {
               .manifestList(manifestListLocation)
               .summary(nessie.icebergSnapshotSummary())
               .timestampMs(timestampMs)
-              .sequenceNumber(nessie.icebergSnapshotSequenceNumber());
+              .sequenceNumber(nessie.icebergSnapshotSequenceNumber())
+              .parentSnapshotId(parentSnapshotId);
       metadata.addSnapshots(snapshot.build());
 
       metadata.putRef(
           "main", IcebergSnapshotRef.builder().snapshotId(snapshotId).type("branch").build());
-
-      for (NessieEntitySnapshot<?> previous : history) {
-        var previousTmd =
-            nessieTableSnapshotToIceberg(
-                (NessieTableSnapshot) previous, List.of(), requestedSpecVersion, m -> {});
-        var previousSnap = previousTmd.currentSnapshot().orElseThrow();
-        metadata.addSnapshot(previousSnap);
-        metadata.addSnapshotLog(
-            IcebergSnapshotLogEntry.snapshotLogEntry(
-                previousSnap.timestampMs(), previousSnap.snapshotId()));
-        // TODO we don't include the metadata location yet - we could potentially do that later
-        // metadata.addMetadataLog(IcebergHistoryEntry.historyEntry(previousSnap.timestampMs(), ));
-      }
 
       metadata.addSnapshotLog(
           IcebergSnapshotLogEntry.builder()
@@ -1613,6 +1625,23 @@ public class NessieModelIceberg {
         .icebergSnapshotSummary(icebergSnapshot.summary())
         .icebergManifestListLocation(icebergSnapshot.manifestList())
         .icebergManifestFileLocations(icebergSnapshot.manifests());
+
+    // If another Iceberg snapshot was add in this same update-transaction, memoize the previous
+    // snapshot so we can return the full snapshot history.
+    var previouslyAddedSnapshot = state.previouslyAddedSnapshot();
+    if (previouslyAddedSnapshot != null) {
+      snapshotBuilder.putImplicitIcebergSnapshot(
+          previouslyAddedSnapshot.snapshotId(),
+          ImmutableImplicitIcebergSnapshot.builder()
+              .snapshotId(previouslyAddedSnapshot.snapshotId())
+              .schemaId(previouslyAddedSnapshot.schemaId())
+              .manifests(previouslyAddedSnapshot.manifests())
+              .manifestList(previouslyAddedSnapshot.manifestList())
+              .sequenceNumber(previouslyAddedSnapshot.sequenceNumber())
+              .summary(previouslyAddedSnapshot.summary())
+              .timestampMs(previouslyAddedSnapshot.timestampMs())
+              .build());
+    }
 
     state.snapshotAdded(icebergSnapshot);
   }

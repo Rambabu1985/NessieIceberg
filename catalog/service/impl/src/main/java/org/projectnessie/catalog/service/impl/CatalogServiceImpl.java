@@ -35,6 +35,7 @@ import static org.projectnessie.catalog.formats.iceberg.nessie.NessieModelIceber
 import static org.projectnessie.catalog.formats.iceberg.nessie.NessieModelIceberg.typeToEntityName;
 import static org.projectnessie.catalog.formats.iceberg.rest.IcebergMetadataUpdate.SetLocation.setTrustedLocation;
 import static org.projectnessie.catalog.formats.iceberg.rest.IcebergMetadataUpdate.SetProperties.setProperties;
+import static org.projectnessie.catalog.model.snapshot.ImplicitIcebergSnapshot.implicitIcebergSnapshot;
 import static org.projectnessie.catalog.service.api.NessieSnapshotResponse.nessieSnapshotResponse;
 import static org.projectnessie.catalog.service.impl.Util.objIdToNessieId;
 import static org.projectnessie.catalog.service.objtypes.EntitySnapshotObj.snapshotObjIdForContent;
@@ -87,6 +88,7 @@ import org.projectnessie.catalog.formats.iceberg.rest.IcebergMetadataUpdate.SetP
 import org.projectnessie.catalog.formats.iceberg.rest.IcebergUpdateRequirement.AssertCreate;
 import org.projectnessie.catalog.model.id.NessieId;
 import org.projectnessie.catalog.model.ops.CatalogOperation;
+import org.projectnessie.catalog.model.snapshot.ImplicitIcebergSnapshot;
 import org.projectnessie.catalog.model.snapshot.NessieEntitySnapshot;
 import org.projectnessie.catalog.model.snapshot.NessieTableSnapshot;
 import org.projectnessie.catalog.model.snapshot.NessieViewSnapshot;
@@ -126,6 +128,7 @@ import org.projectnessie.versioned.ContentHistoryEntry;
 import org.projectnessie.versioned.RequestMeta;
 import org.projectnessie.versioned.RequestMeta.RequestMetaBuilder;
 import org.projectnessie.versioned.VersionStore;
+import org.projectnessie.versioned.storage.common.exceptions.ObjNotFoundException;
 import org.projectnessie.versioned.storage.common.persist.ObjId;
 import org.projectnessie.versioned.storage.common.persist.Persist;
 import org.slf4j.Logger;
@@ -174,6 +177,17 @@ public class CatalogServiceImpl implements CatalogService {
   public Optional<String> validateStorageLocation(String location) {
     StorageUri uri = StorageUri.of(location);
     return objectIO.canResolve(uri);
+  }
+
+  @Override
+  public boolean checkIcebergSnapshotPresent(String metadataLocation, long versionId) {
+    var objId = snapshotObjIdForContent(metadataLocation, versionId);
+    try {
+      persist.fetchObj(objId);
+      return true;
+    } catch (ObjNotFoundException e) {
+      return false;
+    }
   }
 
   @Override
@@ -340,7 +354,7 @@ public class CatalogServiceImpl implements CatalogService {
     var currentSnapshotStage =
         icebergStuff().retrieveIcebergSnapshot(snapshotObjIdForContent(content), content);
 
-    BiFunction<NessieEntitySnapshot<?>, List<NessieEntitySnapshot<?>>, SnapshotResponse>
+    BiFunction<NessieEntitySnapshot<?>, List<ImplicitIcebergSnapshot>, SnapshotResponse>
         responseBuilder =
             (snapshot, history) ->
                 snapshotResponse(key, content, reqParams, snapshot, history, effectiveReference);
@@ -357,7 +371,7 @@ public class CatalogServiceImpl implements CatalogService {
       ContentKey key,
       NessieEntitySnapshot<?> snapshot,
       Iterator<ContentHistoryEntry> historyLog,
-      BiFunction<NessieEntitySnapshot<?>, List<NessieEntitySnapshot<?>>, R> responseBuilder) {
+      BiFunction<NessieEntitySnapshot<?>, List<ImplicitIcebergSnapshot>, R> responseBuilder) {
     if (!(snapshot instanceof NessieTableSnapshot)) {
       // Not an Iceberg table, no previous snapshots
       return completedStage(responseBuilder.apply(snapshot, List.of()));
@@ -371,11 +385,12 @@ public class CatalogServiceImpl implements CatalogService {
 
     // Collect history
 
-    var remainingSnapshotIds = new HashSet<>(previousSnapshotIds);
+    var remainingSnapshotIdsFromHistory = new HashSet<>(previousSnapshotIds);
+    remainingSnapshotIdsFromHistory.removeAll(tableSnapshot.implicitIcebergSnapshots().keySet());
 
     var olderSnaps = new HashMap<Long, CompletableFuture<NessieEntitySnapshot<?>>>();
 
-    while (!remainingSnapshotIds.isEmpty() && historyLog.hasNext()) {
+    while (!remainingSnapshotIdsFromHistory.isEmpty() && historyLog.hasNext()) {
       var next = historyLog.next();
       var nextContent = next.getContent();
       if (!(nextContent instanceof IcebergContent)) {
@@ -383,7 +398,7 @@ public class CatalogServiceImpl implements CatalogService {
         continue;
       }
       var nextSnapshotId = ((IcebergContent) nextContent).getVersionId();
-      if (!remainingSnapshotIds.remove(nextSnapshotId)) {
+      if (!remainingSnapshotIdsFromHistory.remove(nextSnapshotId)) {
         // not a snapshot that we need
         continue;
       }
@@ -408,15 +423,19 @@ public class CatalogServiceImpl implements CatalogService {
 
     return olderSnapsFuture.thenApply(
         x -> {
-          var history = new ArrayList<NessieEntitySnapshot<?>>();
+          var history = new ArrayList<ImplicitIcebergSnapshot>();
           for (Long previousSnapshotId : previousSnapshotIds) {
             try {
               var snapFuture = olderSnaps.get(previousSnapshotId);
-              if (snapFuture != null) {
-                var snap = snapFuture.get(0, TimeUnit.SECONDS);
-                if (snap != null) {
-                  history.add(snap);
-                }
+              var implicitIcebergSnapshot =
+                  snapFuture != null
+                      ? implicitIcebergSnapshot(
+                          (NessieTableSnapshot) snapFuture.get(0, TimeUnit.SECONDS))
+                      : ((NessieTableSnapshot) snapshot)
+                          .implicitIcebergSnapshots()
+                          .get(previousSnapshotId);
+              if (implicitIcebergSnapshot != null) {
+                history.add(implicitIcebergSnapshot);
               } else {
                 LOGGER.warn(
                     "Requested snapshot {} for {} not in Nessie history", previousSnapshotId, key);
@@ -434,7 +453,7 @@ public class CatalogServiceImpl implements CatalogService {
       Content content,
       SnapshotReqParams reqParams,
       NessieEntitySnapshot<?> snapshot,
-      List<NessieEntitySnapshot<?>> history,
+      List<ImplicitIcebergSnapshot> history,
       Reference effectiveReference) {
     if (snapshot instanceof NessieTableSnapshot) {
       return snapshotTableResponse(
@@ -453,7 +472,7 @@ public class CatalogServiceImpl implements CatalogService {
       Content content,
       SnapshotReqParams reqParams,
       NessieTableSnapshot snapshot,
-      List<NessieEntitySnapshot<?>> history,
+      List<ImplicitIcebergSnapshot> history,
       Reference effectiveReference) {
     Object result;
     String fileName;
@@ -794,16 +813,16 @@ public class CatalogServiceImpl implements CatalogService {
                         (snap, history) -> Map.entry(updateState, history));
                   } catch (NessieContentNotFoundException e) {
                     return completedStage(
-                        Map.entry(updateState, List.<NessieEntitySnapshot<?>>of()));
+                        Map.entry(updateState, List.<ImplicitIcebergSnapshot>of()));
                   } catch (NessieNotFoundException e) {
                     throw new RuntimeException(e);
                   }
                 })
             .thenApply(
                 stateWithHistory -> {
-                  IcebergTableMetadataUpdateState updateState = stateWithHistory.getKey();
-                  NessieTableSnapshot nessieSnapshot = updateState.snapshot();
-                  List<NessieEntitySnapshot<?>> history = stateWithHistory.getValue();
+                  var updateState = stateWithHistory.getKey();
+                  var history = stateWithHistory.getValue();
+                  var nessieSnapshot = updateState.snapshot();
                   // Note: 'history' contains the _current_ snapshot on which the table change was
                   // based
                   String metadataJsonLocation =

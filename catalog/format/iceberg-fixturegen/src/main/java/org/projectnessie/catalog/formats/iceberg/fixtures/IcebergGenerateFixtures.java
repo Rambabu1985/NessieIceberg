@@ -211,7 +211,7 @@ public class IcebergGenerateFixtures {
             .defaultSpecId(schemaGenerator.getIcebergPartitionSpec().specId())
             .defaultSortOrderId(IcebergSortOrder.UNSORTED_ORDER.orderId())
             .lastSequenceNumber(1L)
-            .snapshots(singletonList(snapshotWithManifestList))
+            .addSnapshot(snapshotWithManifestList)
             .build();
     metadataConsumer.accept(icebergMetadataWithManifestList);
     return writer.write(
